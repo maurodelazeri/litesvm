@@ -336,13 +336,8 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state, RentState},
         },
     },
-    agave_feature_set::{
-        increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
-    },
+    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
-    agave_syscalls::{
-        create_program_runtime_environment_v1, create_program_runtime_environment_v2,
-    },
     log::error,
     serde::de::DeserializeOwned,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
@@ -368,10 +363,13 @@ use {
     solana_native_token::LAMPORTS_PER_SOL,
     solana_nonce::{state::DurableNonce, NONCED_TX_MARKER_IX_INDEX},
     solana_program_runtime::{
-        invoke_context::{BuiltinFunctionWithContext, EnvironmentConfig, InvokeContext},
-        loaded_programs::{LoadProgramMetrics, ProgramCacheEntry},
-        solana_sbpf::program::BuiltinFunction,
+        invoke_context::{BuiltinFunctionRegisterer, EnvironmentConfig, InvokeContext},
+        loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
+        program_cache_entry::ProgramCacheEntry,
+        program_metrics::LoadProgramMetrics,
+        solana_sbpf::program::BuiltinFunctionDefinition,
     },
+    solana_syscalls::create_program_runtime_environment,
     solana_rent::Rent,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config as config_program,
@@ -590,8 +588,8 @@ impl LiteSVM {
                 .feature_set
                 .is_active(&agave_feature_set::deprecate_rent_exemption_threshold::id())
             {
-                rent_account.exemption_threshold = 1.0;
-                rent_account.lamports_per_byte_year = solana_rent::DEFAULT_LAMPORTS_PER_BYTE
+                rent_account.exemption_threshold = 1.0f64.to_le_bytes();
+                rent_account.lamports_per_byte = solana_rent::DEFAULT_LAMPORTS_PER_BYTE
             }
             self.set_sysvar(&rent_account);
         }
@@ -700,7 +698,7 @@ impl LiteSVM {
                 .is_none_or(|x| self.feature_set.is_active(&x))
             {
                 let loaded_program =
-                    ProgramCacheEntry::new_builtin(0, builtint.name.len(), builtint.entrypoint);
+                    ProgramCacheEntry::new_builtin(0, builtint.name.len(), builtint.register_fn);
                 self.accounts
                     .programs_cache
                     .replenish(builtint.program_id, Arc::new(loaded_program));
@@ -720,10 +718,8 @@ impl LiteSVM {
             .unwrap_or(ComputeBudget::new_with_defaults(
                 self.feature_set
                     .is_active(&raise_cpi_nesting_limit_to_8::ID),
-                self.feature_set
-                    .is_active(&increase_cpi_account_info_limit::ID),
             ));
-        let program_runtime_v1 = create_program_runtime_environment_v1(
+        let program_runtime_environment = create_program_runtime_environment(
             &self.feature_set.runtime_features(),
             &compute_budget.to_budget(),
             false,
@@ -731,13 +727,12 @@ impl LiteSVM {
         )
         .unwrap();
 
-        let program_runtime_v2 = create_program_runtime_environment_v2(
-            &compute_budget.to_budget(),
-            _enable_register_tracing,
+        // LiteSVM never crosses an epoch boundary, so the execution and
+        // deployment environments are identical.
+        self.accounts.environments = ProgramRuntimeEnvironments::new(
+            program_runtime_environment.clone(),
+            program_runtime_environment,
         );
-
-        self.accounts.environments.program_runtime_v1 = Arc::new(program_runtime_v1);
-        self.accounts.environments.program_runtime_v2 = Arc::new(program_runtime_v2);
     }
 
     /// Changes the default builtins.
@@ -917,7 +912,7 @@ impl LiteSVM {
     }
 
     /// Adds a builtin program to the test environment.
-    pub fn add_builtin(&mut self, program_id: Address, entrypoint: BuiltinFunctionWithContext) {
+    pub fn add_builtin(&mut self, program_id: Address, register_fn: BuiltinFunctionRegisterer) {
         let builtin = ProgramCacheEntry::new_builtin(
             self.accounts
                 .sysvar_cache
@@ -925,7 +920,7 @@ impl LiteSVM {
                 .unwrap_or_default()
                 .slot,
             1,
-            entrypoint,
+            register_fn,
         );
 
         self.accounts
@@ -1019,14 +1014,15 @@ impl LiteSVM {
             )));
         };
 
-        let effective_slot = current_slot
-            .saturating_add(solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET);
+        let effective_slot = current_slot.saturating_add(
+            solana_program_runtime::program_cache_entry::DELAY_VISIBILITY_SLOT_OFFSET,
+        );
         let mut loaded_program = if PREVERIFIED {
             // Safety: PREVERIFIED means the program was previously verified.
             unsafe {
                 ProgramCacheEntry::reload(
                     loader_id,
-                    self.accounts.environments.program_runtime_v1.clone(),
+                    self.accounts.environments.get_env_for_execution().clone(),
                     current_slot,
                     effective_slot,
                     program_bytes,
@@ -1037,7 +1033,7 @@ impl LiteSVM {
         } else {
             ProgramCacheEntry::new(
                 loader_id,
-                self.accounts.environments.program_runtime_v1.clone(),
+                self.accounts.environments.get_env_for_execution().clone(),
                 current_slot,
                 effective_slot,
                 program_bytes,
@@ -1178,8 +1174,6 @@ impl LiteSVM {
             ..ComputeBudget::new_with_defaults(
                 self.feature_set
                     .is_active(&raise_cpi_nesting_limit_to_8::ID),
-                self.feature_set
-                    .is_active(&increase_cpi_account_info_limit::ID),
             )
         });
         let rent = self.accounts.sysvar_cache.get_rent().unwrap();
@@ -1192,7 +1186,6 @@ impl LiteSVM {
         let prioritization_fee = compute_budget_limits.get_prioritization_fee();
         let fee = solana_fee::calculate_fee(
             message,
-            false,
             self.fee_structure.lamports_per_signature,
             prioritization_fee,
             FeeFeatures::from(&self.feature_set),
@@ -1296,6 +1289,11 @@ impl LiteSVM {
 
         match maybe_program_indices {
             Ok(program_indices) => {
+                // `program_indices` is only consumed by the invocation-inspect
+                // callback; `prepare_top_level_instructions` derives indices
+                // internally during `process_message`.
+                #[cfg(not(feature = "invocation-inspect-callback"))]
+                let _ = &program_indices;
                 let mut context = self.create_transaction_context(
                     compute_budget,
                     accounts,
@@ -1308,9 +1306,9 @@ impl LiteSVM {
                     EnvironmentConfig::new(
                         *blockhash,
                         self.fee_structure.lamports_per_signature,
+                        false,
                         self,
                         &feature_set,
-                        &self.accounts.environments,
                         &self.accounts.environments,
                         &self.accounts.sysvar_cache,
                     ),
@@ -1330,7 +1328,6 @@ impl LiteSVM {
 
                 let mut tx_result = process_message(
                     message,
-                    &program_indices,
                     &mut invoke_context,
                     &mut ExecuteTimings::default(),
                     &mut accumulated_consume_units,
@@ -1751,41 +1748,59 @@ impl LiteSVM {
         self.invocation_inspect_callback = Arc::new(callback);
     }
 
-    /// Registers a custom syscall in both program runtime environments (v1 and v2).
+    /// Registers a custom syscall in the program runtime environment.
     ///
-    /// **Must be called after `with_builtins()`** (which recreates the environments
+    /// `Syscall` must implement [`BuiltinFunctionDefinition`], which is what the
+    /// `solana_sbpf::declare_builtin_function!` macro produces. It supplies both
+    /// the interpreter (`vm`) and JIT (`codegen`) sides of the syscall, so the
+    /// registered function executes correctly under both execution modes.
+    ///
+    /// **Must be called after `with_builtins()`** (which recreates the environment
     /// from scratch) and **before `with_default_programs()`** (which clones the
-    /// environment Arcs into program cache entries, preventing further mutation).
+    /// environment Arc into program cache entries, preventing further mutation).
     ///
-    /// Panics if the runtime environments cannot be mutated or if registration
-    /// fails. This is intentional — a misconfigured syscall should fail loudly
-    /// rather than silently.
-    pub fn with_custom_syscall(
-        mut self,
-        name: &str,
-        syscall: BuiltinFunction<InvokeContext<'static, 'static>>,
-    ) -> Self {
-        let (Some(program_runtime_v1), Some(program_runtime_v2)) = (
-            Arc::get_mut(&mut self.accounts.environments.program_runtime_v1),
-            Arc::get_mut(&mut self.accounts.environments.program_runtime_v2),
-        ) else {
-            panic!("with_custom_syscall: can't mutate program runtimes");
+    /// Panics if the runtime environment cannot be built/mutated or if
+    /// registration fails. This is intentional — a misconfigured syscall should
+    /// fail loudly rather than silently.
+    pub fn with_custom_syscall<Syscall>(mut self, name: &str) -> Self
+    where
+        Syscall: BuiltinFunctionDefinition<InvokeContext<'static, 'static>>,
+    {
+        // In agave 4.1 the program runtime environment is private and the
+        // execution/deployment environments share an Arc (see `set_builtins`),
+        // so the existing environment cannot be mutated in place. Build a fresh
+        // environment, register the syscall into its uniquely-owned
+        // `BuiltinProgram`, then rebuild the environments.
+        let _enable_register_tracing = false;
+        #[cfg(feature = "register-tracing")]
+        let _enable_register_tracing = self.enable_register_tracing;
+
+        let compute_budget = self
+            .compute_budget
+            .unwrap_or(ComputeBudget::new_with_defaults(
+                self.feature_set
+                    .is_active(&raise_cpi_nesting_limit_to_8::ID),
+            ));
+        let environment = create_program_runtime_environment(
+            &self.feature_set.runtime_features(),
+            &compute_budget.to_budget(),
+            false,
+            _enable_register_tracing,
+        )
+        .expect("with_custom_syscall: failed to create program runtime environment");
+
+        let mut inner = (*environment).clone();
+        drop(environment);
+        let Some(program_runtime) = Arc::get_mut(&mut inner) else {
+            panic!("with_custom_syscall: can't mutate program runtime");
         };
 
-        // Once unregister_function is available, users could replace existing built-in
-        // syscalls.
+        Syscall::register(program_runtime, name)
+            .unwrap_or_else(|e| panic!("failed to register syscall '{name}' in runtime: {e}"));
 
-        // TODO: uncomment once https://github.com/anza-xyz/sbpf/pull/153 is available.
-        // let _ = program_runtime_v1.unregister_function(name);
-        program_runtime_v1
-            .register_function(name, syscall)
-            .unwrap_or_else(|e| panic!("failed to register syscall '{name}' in runtime_v1: {e}"));
-
-        // TODO: uncomment once https://github.com/anza-xyz/sbpf/pull/153 is available.
-        // let _ = program_runtime_v2.unregister_function(name);
-        program_runtime_v2
-            .register_function(name, syscall)
-            .unwrap_or_else(|e| panic!("failed to register syscall '{name}' in runtime_v2: {e}"));
+        let environment = ProgramRuntimeEnvironment::from_ref(&inner).clone();
+        self.accounts.environments =
+            ProgramRuntimeEnvironments::new(environment.clone(), environment);
 
         self
     }

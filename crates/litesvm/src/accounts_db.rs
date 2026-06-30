@@ -3,6 +3,7 @@ use hashbrown::HashMap;
 #[cfg(not(feature = "hashbrown"))]
 use std::collections::HashMap;
 use {
+    agave_feature_set::FeatureSet,
     crate::error::{InvalidSysvarDataError, LiteSVMError},
     log::error,
     serde::de::DeserializeOwned,
@@ -19,12 +20,15 @@ use {
     },
     solana_nonce as nonce,
     solana_program_runtime::{
-        loaded_programs::{
-            LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
-            ProgramCacheForTxBatch, ProgramRuntimeEnvironments,
+        execution_budget::SVMTransactionExecutionBudget,
+        loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironments},
+        program_cache_entry::{
+            ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
         },
+        program_metrics::LoadProgramMetrics,
         sysvar_cache::SysvarCache,
     },
+    solana_syscalls::create_program_runtime_environment,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
         sysvar::{
@@ -66,12 +70,51 @@ where
     Ok(())
 }
 
-#[derive(Clone, Default)]
 pub struct AccountsDb {
     pub inner: HashMap<Address, AccountSharedData>,
     pub programs_cache: ProgramCacheForTxBatch,
     pub sysvar_cache: SysvarCache,
     pub environments: ProgramRuntimeEnvironments,
+}
+
+impl Default for AccountsDb {
+    fn default() -> Self {
+        // agave 4.1's `ProgramRuntimeEnvironments` is neither `Default` nor
+        // `Clone`. Build a placeholder environment here; `LiteSVM::set_builtins`
+        // replaces it with the feature-gated one before any execution.
+        let environment = create_program_runtime_environment(
+            &FeatureSet::default().runtime_features(),
+            &SVMTransactionExecutionBudget::new_with_defaults(false),
+            false,
+            false,
+        )
+        .expect("failed to create default program runtime environment");
+        Self {
+            inner: HashMap::default(),
+            programs_cache: ProgramCacheForTxBatch::default(),
+            sysvar_cache: SysvarCache::default(),
+            environments: ProgramRuntimeEnvironments::new(
+                environment.clone(),
+                environment,
+            ),
+        }
+    }
+}
+
+impl Clone for AccountsDb {
+    fn clone(&self) -> Self {
+        // `ProgramRuntimeEnvironments` is not `Clone`, but the inner
+        // `ProgramRuntimeEnvironment`s (Arc-backed) are; rebuild it from them.
+        Self {
+            inner: self.inner.clone(),
+            programs_cache: self.programs_cache.clone(),
+            sysvar_cache: self.sysvar_cache.clone(),
+            environments: ProgramRuntimeEnvironments::new(
+                self.environments.get_env_for_execution().clone(),
+                self.environments.get_env_for_deployment().clone(),
+            ),
+        }
+    }
 }
 
 impl AccountsDb {
@@ -268,7 +311,7 @@ impl AccountsDb {
         let metrics = &mut LoadProgramMetrics::default();
 
         let owner = program_account.owner();
-        let program_runtime_v1 = self.environments.program_runtime_v1.clone();
+        let program_runtime_v1 = self.environments.get_env_for_execution().clone();
         let slot = self.sysvar_cache.get_clock().map(|c| c.slot).unwrap_or(0);
 
         if bpf_loader::check_id(owner) || bpf_loader_deprecated::check_id(owner) {

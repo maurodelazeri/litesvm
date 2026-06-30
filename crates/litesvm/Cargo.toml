@@ -19,8 +19,15 @@ invocation-inspect-callback = []
 nodejs-internal = ["dep:qualifier_attr"]
 hashbrown = ["dep:hashbrown"]
 sbpf-debugger = ["register-tracing", "solana-program-runtime/sbpf-debugger"]
-serde = []
-persistence-internal = ["serde"]
+serde = [
+    "solana-account/serde",
+    "solana-address/serde",
+    "solana-message/serde",
+    "solana-signature/serde",
+    "solana-transaction-context/serde",
+    "solana-transaction-error/serde",
+]
+persistence-internal = ["serde", "solana-signature/serde"]
 precompiles = ["dep:agave-precompiles"]
 register-tracing = ["invocation-inspect-callback", "dep:hex", "dep:sha2", "dep:nom"]
 
@@ -32,7 +39,7 @@ agave-precompiles = { workspace = true, optional = true, features = [
 agave-reserved-account-keys = { workspace = true, features = [
     "agave-unstable-api",
 ] }
-agave-syscalls.workspace = true
+solana-syscalls = { workspace = true, features = ["agave-unstable-api"] }
 ansi_term.workspace = true
 bincode.workspace = true
 hashbrown = { workspace = true, optional = true }
@@ -67,14 +74,16 @@ solana-keypair.workspace = true
 solana-last-restart-slot.workspace = true
 solana-loader-v3-interface.workspace = true
 solana-loader-v4-interface.workspace = true
-solana-loader-v4-program.workspace = true
 solana-message.workspace = true
 solana-native-token.workspace = true
 solana-nonce.workspace = true
 solana-nonce-account.workspace = true
 solana-precompile-error.workspace = true
 solana-program-error.workspace = true
-solana-program-runtime.workspace = true
+solana-program-runtime = { workspace = true, features = [
+    "agave-unstable-api",
+    "metrics",
+] }
 solana-rent.workspace = true
 solana-sdk-ids.workspace = true
 solana-sha256-hasher.workspace = true
@@ -105,6 +114,7 @@ ed25519-dalek.workspace = true
 libsecp256k1.workspace = true
 serde.workspace = true
 solana-clock.workspace = true
+solana-hash = { workspace = true, features = ["atomic"] }
 solana-compute-budget-interface.workspace = true
 solana-ed25519-program.workspace = true
 solana-keypair.workspace = true
