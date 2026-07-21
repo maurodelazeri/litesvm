@@ -369,7 +369,6 @@ use {
         program_metrics::LoadProgramMetrics,
         solana_sbpf::program::BuiltinFunctionDefinition,
     },
-    solana_syscalls::create_program_runtime_environment,
     solana_rent::Rent,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config as config_program,
@@ -379,10 +378,11 @@ use {
     solana_signer::Signer,
     solana_slot_hashes::SlotHashes,
     solana_slot_history::SlotHistory,
-    solana_stake_interface::stake_history::StakeHistory,
+    solana_stake_history::StakeHistory,
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::svm_message::SVMStaticMessage,
+    solana_syscalls::create_program_runtime_environment,
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::{Sysvar, SysvarSerialize},
     solana_sysvar_id::SysvarId,
@@ -1197,7 +1197,7 @@ impl LiteSVM {
             .enumerate()
             .map(|(i, key)| {
                 let account = if solana_sdk_ids::sysvar::instructions::check_id(key) {
-                    construct_instructions_account(message)
+                    construct_instructions_account(message)?
                 } else {
                     let is_instruction_account = message.is_instruction_account(i);
                     let mut account = if !is_instruction_account
@@ -1936,8 +1936,7 @@ fn execute_tx_helper(
     let ExecutionRecord {
         accounts,
         return_data,
-        touched_account_count: _,
-        accounts_resize_delta: _,
+        ..
     } = ctx.into();
     let msg = sanitized_tx.message();
     let post_accounts = accounts

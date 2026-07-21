@@ -3,8 +3,8 @@ use hashbrown::HashMap;
 #[cfg(not(feature = "hashbrown"))]
 use std::collections::HashMap;
 use {
-    agave_feature_set::FeatureSet,
     crate::error::{InvalidSysvarDataError, LiteSVMError},
+    agave_feature_set::FeatureSet,
     log::error,
     serde::de::DeserializeOwned,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, WritableAccount},
@@ -22,13 +22,10 @@ use {
     solana_program_runtime::{
         execution_budget::SVMTransactionExecutionBudget,
         loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironments},
-        program_cache_entry::{
-            ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
-        },
+        program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
         program_metrics::LoadProgramMetrics,
         sysvar_cache::SysvarCache,
     },
-    solana_syscalls::create_program_runtime_environment,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
         sysvar::{
@@ -38,6 +35,7 @@ use {
             stake_history::ID as STAKE_HISTORY_ID,
         },
     },
+    solana_syscalls::create_program_runtime_environment,
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::Sysvar,
     solana_transaction_error::{AddressLoaderError, TransactionError},
@@ -93,10 +91,7 @@ impl Default for AccountsDb {
             inner: HashMap::default(),
             programs_cache: ProgramCacheForTxBatch::default(),
             sysvar_cache: SysvarCache::default(),
-            environments: ProgramRuntimeEnvironments::new(
-                environment.clone(),
-                environment,
-            ),
+            environments: ProgramRuntimeEnvironments::new(environment.clone(), environment),
         }
     }
 }
@@ -238,7 +233,7 @@ impl AccountsDb {
                 )?;
             }
             STAKE_HISTORY_ID => {
-                handle_sysvar::<solana_stake_interface::stake_history::StakeHistory>(
+                handle_sysvar::<solana_stake_history::StakeHistory>(
                     cache,
                     StakeHistory,
                     account,
