@@ -336,18 +336,17 @@ use {
             rent::{check_rent_state_with_account, get_account_rent_state, RentState},
         },
     },
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_feature_set::{enable_tx_v1, raise_cpi_nesting_limit_to_8, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
     log::error,
     serde::de::DeserializeOwned,
-    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
+    solana_account::{
+        state_traits::StateMut, Account, AccountSharedData, ReadableAccount, WritableAccount,
+    },
     solana_address::Address,
     solana_builtins::BUILTINS,
     solana_clock::Clock,
-    solana_compute_budget::{
-        compute_budget::ComputeBudget, compute_budget_limits::ComputeBudgetLimits,
-    },
-    solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
+    solana_compute_budget::compute_budget::ComputeBudget,
     solana_epoch_rewards::EpochRewards,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface::{self as feature_gate, Feature},
@@ -370,6 +369,7 @@ use {
         solana_sbpf::program::BuiltinFunctionDefinition,
     },
     solana_rent::Rent,
+    solana_runtime_transaction::transaction_meta::TransactionConfiguration,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config as config_program,
         native_loader, system_program,
@@ -1156,7 +1156,7 @@ impl LiteSVM {
     fn process_transaction<'a, 'b>(
         &'a self,
         tx: &'b SanitizedTransaction,
-        compute_budget_limits: ComputeBudgetLimits,
+        transaction_config: TransactionConfiguration,
         log_collector: Rc<RefCell<LogCollector>>,
     ) -> (
         Result<(), TransactionError>,
@@ -1169,8 +1169,8 @@ impl LiteSVM {
         'a: 'b,
     {
         let compute_budget = self.compute_budget.unwrap_or_else(|| ComputeBudget {
-            compute_unit_limit: u64::from(compute_budget_limits.compute_unit_limit),
-            heap_size: compute_budget_limits.updated_heap_bytes,
+            compute_unit_limit: u64::from(transaction_config.compute_unit_limit),
+            heap_size: transaction_config.updated_heap_bytes,
             ..ComputeBudget::new_with_defaults(
                 self.feature_set
                     .is_active(&raise_cpi_nesting_limit_to_8::ID),
@@ -1183,7 +1183,9 @@ impl LiteSVM {
         let mut program_cache_for_tx_batch = self.accounts.programs_cache.clone();
         let mut accumulated_consume_units = 0;
         let account_keys = message.account_keys();
-        let prioritization_fee = compute_budget_limits.get_prioritization_fee();
+        // For legacy/v0 this was derived from the ComputeBudget instructions;
+        // for v1 it is the message config's total, verbatim.
+        let prioritization_fee = transaction_config.priority_fee_lamports;
         let fee = solana_fee::calculate_fee(
             message,
             self.fee_structure.lamports_per_signature,
@@ -1192,28 +1194,77 @@ impl LiteSVM {
         );
         let mut validated_fee_payer = false;
         let mut payer_key = None;
+        // Loaded-accounts data-size accounting, mirroring agave's account
+        // loader (`svm/src/account_loader.rs`): a fixed charge per address
+        // lookup table, 64 bytes of base overhead plus the data length per
+        // existing account, and LoaderV3 programdata counted exactly once even
+        // when it is not referenced by the transaction. Without this check a
+        // v1 transaction that omits `loaded_accounts_data_size_limit`
+        // (which resolves to zero) would execute here but fail on mainnet.
+        const TRANSACTION_ACCOUNT_BASE_SIZE: usize = 64;
+        const ADDRESS_LOOKUP_TABLE_BASE_SIZE: usize = 8248;
+        let loaded_size_limit = transaction_config.loaded_accounts_data_size_limit;
+        let mut loaded_accounts_data_size: u32 = 0;
+        let mut counted_programdata: Vec<Address> = Vec::new();
+        if let Err(e) = accumulate_loaded_account_data_size(
+            &mut loaded_accounts_data_size,
+            message
+                .num_lookup_tables()
+                .saturating_mul(ADDRESS_LOOKUP_TABLE_BASE_SIZE),
+            loaded_size_limit,
+        ) {
+            return (Err(e), accumulated_consume_units, None, fee, payer_key);
+        }
         let maybe_accounts = account_keys
             .iter()
             .enumerate()
             .map(|(i, key)| {
                 let account = if solana_sdk_ids::sysvar::instructions::check_id(key) {
+                    // The instructions sysvar is constructed by the SVM and
+                    // does not count toward the loaded data size.
                     construct_instructions_account(message)?
                 } else {
                     let is_instruction_account = message.is_instruction_account(i);
-                    let mut account = if !is_instruction_account
-                        && !message.is_writable(i)
-                        && self.accounts.programs_cache.find(key).is_some()
-                    {
-                        // Optimization to skip loading of accounts which are only used as
-                        // programs in top-level instructions and not passed as instruction accounts.
-                        self.accounts.get_account(key).unwrap()
-                    } else {
-                        self.accounts.get_account(key).unwrap_or_else(|| {
-                            let mut default_account = AccountSharedData::default();
-                            default_account.set_rent_epoch(0);
-                            default_account
-                        })
-                    };
+                    let loaded = self.accounts.get_account(key);
+                    if let Some(ref existing) = loaded {
+                        accumulate_loaded_account_data_size(
+                            &mut loaded_accounts_data_size,
+                            TRANSACTION_ACCOUNT_BASE_SIZE.saturating_add(existing.data().len()),
+                            loaded_size_limit,
+                        )?;
+                        // A valid LoaderV3 program drags its programdata in;
+                        // count it once unless the transaction references it
+                        // directly (then the account_keys pass counts it).
+                        if bpf_loader_upgradeable::check_id(existing.owner()) {
+                            if let Ok(UpgradeableLoaderState::Program {
+                                programdata_address,
+                            }) = existing.state()
+                            {
+                                if !account_keys.iter().any(|k| *k == programdata_address)
+                                    && !counted_programdata.contains(&programdata_address)
+                                {
+                                    if let Some(programdata) =
+                                        self.accounts.get_account(&programdata_address)
+                                    {
+                                        accumulate_loaded_account_data_size(
+                                            &mut loaded_accounts_data_size,
+                                            TRANSACTION_ACCOUNT_BASE_SIZE
+                                                .saturating_add(programdata.data().len()),
+                                            loaded_size_limit,
+                                        )?;
+                                        counted_programdata.push(programdata_address);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Accounts that do not exist load as defaults and count
+                    // zero bytes, matching agave.
+                    let mut account = loaded.unwrap_or_else(|| {
+                        let mut default_account = AccountSharedData::default();
+                        default_account.set_rent_epoch(0);
+                        default_account
+                    });
                     if !validated_fee_payer && (!message.is_invoked(i) || is_instruction_account) {
                         validate_fee_payer(key, &mut account, i as IndexOfAccount, &rent, fee)?;
                         validated_fee_payer = true;
@@ -1494,10 +1545,10 @@ impl LiteSVM {
         'a: 'b,
     {
         self.maybe_blockhash_check(sanitized_tx)?;
-        let compute_budget_limits = get_compute_budget_limits(sanitized_tx, &self.feature_set)?;
+        let transaction_config = get_transaction_configuration(sanitized_tx, &self.feature_set)?;
         self.maybe_history_check(sanitized_tx)?;
         let (result, compute_units_consumed, context, fee, payer_key) =
-            self.process_transaction(sanitized_tx, compute_budget_limits, log_collector);
+            self.process_transaction(sanitized_tx, transaction_config, log_collector);
         Ok(CheckAndProcessTransactionSuccess {
             core: {
                 CheckAndProcessTransactionSuccessCore {
@@ -1947,15 +1998,47 @@ fn execute_tx_helper(
     (signature, return_data, inner_instructions, post_accounts)
 }
 
-fn get_compute_budget_limits(
+fn get_transaction_configuration(
     sanitized_tx: &SanitizedTransaction,
     feature_set: &FeatureSet,
-) -> Result<ComputeBudgetLimits, ExecutionResult> {
-    process_compute_budget_instructions(sanitized_tx.program_instructions_iter(), feature_set)
+) -> Result<TransactionConfiguration, ExecutionResult> {
+    // The runtime discards v1 transactions until the `enable_tx_v1` gate is
+    // active (agave `Bank::filter_v1_transactions`).
+    if matches!(sanitized_tx.message(), SanitizedMessage::V1(_))
+        && !feature_set.is_active(&enable_tx_v1::ID)
+    {
+        return Err(ExecutionResult {
+            tx_result: Err(TransactionError::UnsupportedVersion),
+            ..Default::default()
+        });
+    }
+    // Version-aware budget: legacy/v0 read ComputeBudget instructions, v1
+    // reads the message's `TransactionConfig` (agave `transaction_meta.rs`).
+    TransactionConfiguration::try_from_sanitized_message(sanitized_tx.message(), feature_set)
         .map_err(|e| ExecutionResult {
             tx_result: Err(e),
             ..Default::default()
         })
+}
+
+/// Mirrors agave's account-loader data-size accounting (`svm/src/account_loader.rs`):
+/// 64 bytes of base overhead plus the data length for every account that
+/// exists, with the running total checked against the transaction's requested
+/// limit.
+fn accumulate_loaded_account_data_size(
+    total: &mut u32,
+    delta: usize,
+    limit: u32,
+) -> Result<(), TransactionError> {
+    let Ok(delta) = u32::try_from(delta) else {
+        return Err(TransactionError::MaxLoadedAccountsDataSizeExceeded);
+    };
+    *total = total.saturating_add(delta);
+    if *total > limit {
+        Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
+    } else {
+        Ok(())
+    }
 }
 
 /// Get the max number of accounts that a transaction may lock in this block
